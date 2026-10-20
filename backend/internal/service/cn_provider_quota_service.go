@@ -67,8 +67,8 @@ type CNProviderQuotaProbeResult struct {
 	Balance *CNProviderBalanceResult `json:"balance,omitempty"`
 }
 
-// CNProviderQuotaService 探测 Kimi / Zhipu / MiniMax Coding Plan、OpenCode Go、
-// Command Code 与 Cline（ClinePass）的滚动窗口用量。
+// CNProviderQuotaService 探测 Kimi / Zhipu / MiniMax / StepFun Coding Plan、
+// OpenCode Go、Command Code 与 Cline（ClinePass）的滚动窗口用量。
 type CNProviderQuotaService struct {
 	accountRepo  AccountRepository
 	proxyRepo    ProxyRepository
@@ -141,8 +141,8 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 	if provider == PlatformCline {
 		return s.queryClineUsage(ctx, account)
 	}
-	if provider != PlatformKimi && provider != PlatformZhipu && provider != PlatformMiniMax && provider != PlatformOpenCodeGo {
-		return nil, infraerrors.New(http.StatusBadRequest, "CN_QUOTA_NOT_CODING_PLAN", "account is not a kimi/zhipu/minimax coding plan or opencode go account")
+	if provider != PlatformKimi && provider != PlatformZhipu && provider != PlatformMiniMax && provider != PlatformStepfun && provider != PlatformOpenCodeGo {
+		return nil, infraerrors.New(http.StatusBadRequest, "CN_QUOTA_NOT_CODING_PLAN", "account is not a kimi/zhipu/minimax/stepfun coding plan or opencode go account")
 	}
 
 	apiKey := strings.TrimSpace(account.GetCNAPIKey())
@@ -175,6 +175,9 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 		}
 	case PlatformMiniMax:
 		targetURL = minimaxQuotaURL(baseURL)
+		authHeader = "Bearer " + apiKey
+	case PlatformStepfun:
+		targetURL = stepfunQuotaURL(baseURL)
 		authHeader = "Bearer " + apiKey
 	}
 
@@ -245,6 +248,20 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 		}
 	}
 
+	// Step Plan 用 quota.state 表达「未开通 / 不可用」；HTTP 200 说明 Key 本身有效。
+	if provider == PlatformStepfun {
+		state := strings.ToLower(strings.TrimSpace(gjson.GetBytes(bodyBytes, "quota.state").String()))
+		if state != "" && state != "known" {
+			reason := strings.TrimSpace(gjson.GetBytes(bodyBytes, "quota.reason").String())
+			if reason == "" {
+				reason = "Step Plan quota unavailable (" + state + ")"
+			}
+			result.Error = reason
+			result.CredentialValid = true
+			return result, nil
+		}
+	}
+
 	var tiers []CNQuotaTier
 	switch provider {
 	case PlatformKimi:
@@ -266,6 +283,13 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 		}
 		tiers = parseMiniMaxUsageTiers(bodyBytes)
 		result.PlanLevel = strings.TrimSpace(gjson.GetBytes(bodyBytes, "current_subscribe_title").String())
+	case PlatformStepfun:
+		tiers, result.PlanLevel = parseStepFunUsageTiers(bodyBytes)
+		if len(tiers) == 0 {
+			result.Error = "Step Plan quota response has no usage windows"
+			result.CredentialValid = true
+			return result, nil
+		}
 	}
 	result.Tiers = tiers
 	result.Success = true

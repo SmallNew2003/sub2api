@@ -325,6 +325,75 @@ func TestMiniMaxQuotaURL(t *testing.T) {
 		minimaxQuotaURL("https://custom.example.com"))
 }
 
+func TestStepFunQuotaURL(t *testing.T) {
+	t.Parallel()
+	const want = "https://api.stepfun.com/step_plan/v1/usage"
+	require.Equal(t, want, stepfunQuotaURL("https://api.stepfun.com/step_plan/v1"))
+	require.Equal(t, want, stepfunQuotaURL("https://api.stepfun.com/step_plan"))
+	require.Equal(t, want, stepfunQuotaURL("https://api.stepfun.com/step_plan/"))
+	require.Equal(t, want, stepfunQuotaURL("https://api.stepfun.com/step_plan/v1/"))
+}
+
+func TestParseStepFunUsageTiers_CreditPlan(t *testing.T) {
+	t.Parallel()
+	resetMs := int64(1_700_000_000_000)
+	body := []byte(`{
+		"plan": {"state": "known", "name": "Plus"},
+		"quota": {
+			"state": "known",
+			"allowed": true,
+			"credit_buckets": [
+				{"total": 1000000, "remaining": 200000, "used_percent": 80, "expires_at_ms": 1700000000000},
+				{"total": 3000000, "remaining": 1800000, "used_percent": 40, "expires_at_ms": 1700000000000}
+			],
+			"windows": []
+		}
+	}`)
+	tiers, plan := parseStepFunUsageTiers(body)
+	require.Equal(t, "Plus", plan)
+	require.Len(t, tiers, 1)
+	require.Equal(t, "monthly", tiers[0].Window)
+	require.InDelta(t, 50, tiers[0].UsedPercent, 1e-9) // (4M-2M)/4M
+	require.Equal(t, time.UnixMilli(resetMs).UTC().Format(time.RFC3339), tiers[0].ResetAt)
+}
+
+func TestParseStepFunUsageTiers_Windows(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"plan": {"state": "known", "name": "Pro"},
+		"quota": {
+			"state": "known",
+			"credit_buckets": [],
+			"windows": [
+				{"name": "5h", "used_percent": 12.5, "resets_at_ms": 1700000000000},
+				{"type": "weekly", "used_percent": 42, "resets_at_ms": 1700604800000}
+			]
+		}
+	}`)
+	tiers, plan := parseStepFunUsageTiers(body)
+	require.Equal(t, "Pro", plan)
+	require.Len(t, tiers, 2)
+	require.Equal(t, "5h", tiers[0].Window)
+	require.InDelta(t, 12.5, tiers[0].UsedPercent, 1e-9)
+	require.Equal(t, "weekly", tiers[1].Window)
+	require.InDelta(t, 42, tiers[1].UsedPercent, 1e-9)
+}
+
+func TestParseStepFunUsageTiers_CreditWinsOverMonthlyWindow(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"quota": {
+			"state": "known",
+			"credit_buckets": [{"total": 100, "remaining": 25, "expires_at_ms": 1700000000000}],
+			"windows": [{"name": "credit", "used_percent": 99, "resets_at_ms": 1700000000000}]
+		}
+	}`)
+	tiers, _ := parseStepFunUsageTiers(body)
+	require.Len(t, tiers, 1)
+	require.Equal(t, "monthly", tiers[0].Window)
+	require.InDelta(t, 75, tiers[0].UsedPercent, 1e-9)
+}
+
 func TestParseMiniMaxUsageTiers(t *testing.T) {
 	t.Parallel()
 	endMs := int64(1_700_000_000_000)
@@ -393,6 +462,49 @@ func TestGetCodingPlanProvider_MiniMax(t *testing.T) {
 	}}).GetCodingPlanProvider())
 }
 
+func TestGetCodingPlanProvider_StepFun(t *testing.T) {
+	t.Parallel()
+	for _, base := range []string{
+		"https://api.stepfun.com/step_plan",
+		"https://api.stepfun.com/step_plan/",
+		"https://api.stepfun.com/step_plan/v1",
+		"https://api.stepfun.com/step_plan/v1/",
+		"https://api.stepfun.ai/step_plan",
+		"https://api.stepfun.ai/step_plan/v1/",
+	} {
+		account := &Account{Platform: PlatformStepfun, Type: AccountTypeAPIKey, Credentials: map[string]any{
+			"account_mode": AccountModeCoding,
+			"base_url":     base,
+		}}
+		require.Equal(t, PlatformStepfun, account.GetCodingPlanProvider(), base)
+	}
+
+	// 未配 base_url 时走 coding 默认端点。
+	require.Equal(t, PlatformStepfun, (&Account{Platform: PlatformStepfun, Type: AccountTypeAPIKey, Credentials: map[string]any{
+		"account_mode": AccountModeCoding,
+	}}).GetCodingPlanProvider())
+	// payg Key 与 Step Plan Key 不互通，不做订阅额度探测。
+	require.Empty(t, (&Account{Platform: PlatformStepfun, Credentials: map[string]any{
+		"account_mode": AccountModePayG,
+		"base_url":     "https://api.stepfun.com/v1",
+	}}).GetCodingPlanProvider())
+	for _, base := range []string{
+		"http://api.stepfun.com/step_plan/v1",
+		"https://api.stepfun.com.evil.example/step_plan/v1",
+		"https://relay.example.com/step_plan/v1",
+		"https://api.stepfun.com/step_plan-other",
+		"https://api.stepfun.com/step_plan/v2",
+		"https://api.stepfun.com/step_plan/v1?target=evil",
+		"https://api.stepfun.com/step_plan/v1#evil",
+	} {
+		account := &Account{Platform: PlatformStepfun, Type: AccountTypeAPIKey, Credentials: map[string]any{
+			"account_mode": AccountModeCoding,
+			"base_url":     base,
+		}}
+		require.Empty(t, account.GetCodingPlanProvider(), base)
+	}
+}
+
 // TestCNBalanceURL Kimi 固定端点；DeepSeek 基于 base_url 拼接。
 func TestCNBalanceURL(t *testing.T) {
 	t.Parallel()
@@ -437,6 +549,41 @@ func TestCNProviderThresholdCandidates(t *testing.T) {
 
 	// 空 Extra / nil account 安全返回。
 	require.Empty(t, filterNil(cnProviderThresholdCandidates(&Account{Platform: PlatformKimi}, PlatformKimi)))
+}
+
+// TestCNProviderThresholdCandidates_StepFunMonthly StepFun Credit 套餐只有
+// monthly 快照，也应产生停调候选。
+func TestCNProviderThresholdCandidates_StepFunMonthly(t *testing.T) {
+	t.Parallel()
+	account := &Account{
+		Platform: PlatformStepfun,
+		Extra: map[string]any{
+			"stepfun_monthly_used_percent": 88.0,
+			"stepfun_monthly_reset_at":     "2026-08-18T00:00:00Z",
+		},
+	}
+	cands := filterNil(cnProviderThresholdCandidates(account, PlatformStepfun))
+	require.Len(t, cands, 1)
+	require.Equal(t, "monthly", cands[0].window)
+	require.InDelta(t, 88.0, cands[0].usedPercent, 1e-9)
+}
+
+func TestEvaluateAccountSchedulingThreshold_StepFunCreditPlan(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(10 * 24 * time.Hour)
+	account := &Account{
+		Platform: PlatformStepfun,
+		Extra: map[string]any{
+			"stepfun_monthly_used_percent": 96.0,
+			"stepfun_monthly_reset_at":     reset.Format(time.RFC3339),
+		},
+	}
+	decision := EvaluateAccountSchedulingThreshold(account, map[string]int{PlatformStepfun: 90}, now)
+	require.True(t, decision.ShouldPause)
+	require.Equal(t, PlatformStepfun, decision.Platform)
+	require.Equal(t, "monthly", decision.Window)
+	require.True(t, reset.Equal(*decision.Until))
 }
 
 func filterNil(cands []*accountSchedulingThresholdCandidate) []*accountSchedulingThresholdCandidate {
@@ -691,6 +838,9 @@ func TestGetAPIProtocol(t *testing.T) {
 	require.Equal(t, APIProtocolAdaptive, mk(PlatformMiniMax, APIProtocolAdaptive).GetAPIProtocol())
 	require.Equal(t, APIProtocolAdaptive, mk(PlatformZhipu, APIProtocolAdaptive).GetAPIProtocol())
 	require.Equal(t, APIProtocolAdaptive, mk(PlatformDeepseek, APIProtocolAdaptive).GetAPIProtocol())
+	require.Equal(t, APIProtocolAnthropic, mk(PlatformStepfun, APIProtocolAnthropic).GetAPIProtocol())
+	require.Equal(t, APIProtocolAdaptive, mk(PlatformStepfun, APIProtocolAdaptive).GetAPIProtocol())
+	require.Equal(t, APIProtocolChatCompletions, mk(PlatformStepfun, APIProtocolResponses).GetAPIProtocol(), "stepfun 无 responses 端点")
 	require.Equal(t, APIProtocolChatCompletions, mk(PlatformZhipu, APIProtocolResponses).GetAPIProtocol(), "zhipu 无 responses 端点")
 	require.Equal(t, APIProtocolChatCompletions, mk(PlatformKimi, "bogus").GetAPIProtocol(), "非法值回退默认")
 	require.Equal(t, APIProtocolChatCompletions, (&Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}).GetAPIProtocol(), "非 CN 供应商恒为默认")
@@ -706,6 +856,7 @@ func TestSupportsNativeCNResponses(t *testing.T) {
 	require.True(t, (&Account{Platform: PlatformMiniMax}).SupportsNativeCNResponses())
 	require.True(t, (&Account{Platform: PlatformOpenCodeGo}).SupportsNativeCNResponses())
 	require.False(t, (&Account{Platform: PlatformZhipu}).SupportsNativeCNResponses())
+	require.False(t, (&Account{Platform: PlatformStepfun}).SupportsNativeCNResponses())
 	require.False(t, (&Account{Platform: PlatformOpenAI}).SupportsNativeCNResponses())
 }
 
@@ -728,6 +879,8 @@ func TestAdaptiveProtocolBaseURLs(t *testing.T) {
 		{"deepseek", PlatformDeepseek, AccountModePayG, DefaultDeepseekBaseURL, DefaultDeepseekAnthropicBaseURL, DefaultDeepseekBaseURL},
 		{"minimax payg", PlatformMiniMax, AccountModePayG, DefaultMiniMaxBaseURL, DefaultMiniMaxAnthropicBaseURL, DefaultMiniMaxBaseURL},
 		{"minimax coding", PlatformMiniMax, AccountModeCoding, DefaultMiniMaxBaseURL, DefaultMiniMaxAnthropicBaseURL, DefaultMiniMaxBaseURL},
+		{"stepfun payg", PlatformStepfun, AccountModePayG, DefaultStepFunPayGBaseURL, DefaultStepFunPayGAnthropicBaseURL, ""},
+		{"stepfun coding", PlatformStepfun, AccountModeCoding, DefaultStepFunCodingBaseURL, DefaultStepFunCodingAnthropicBaseURL, ""},
 		{"opencode go", PlatformOpenCodeGo, AccountModeGo, DefaultOpenCodeGoBaseURL, DefaultOpenCodeGoAnthropicBaseURL, DefaultOpenCodeGoBaseURL},
 		{"opencode zen", PlatformOpenCodeGo, AccountModeZen, DefaultOpenCodeZenBaseURL, DefaultOpenCodeZenAnthropicBaseURL, DefaultOpenCodeZenBaseURL},
 	}
