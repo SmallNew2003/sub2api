@@ -248,14 +248,10 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 		}
 	}
 
-	// Step Plan 用 quota.state 表达「未开通 / 不可用」；HTTP 200 说明 Key 本身有效。
+	// Step Plan 的「未开通 / 不可用」由 quota.state / quota.allowed 表达，
+	// 判定与 cc-switch 的 usage_script 一致；HTTP 200 说明 Key 本身有效。
 	if provider == PlatformStepfun {
-		state := strings.ToLower(strings.TrimSpace(gjson.GetBytes(bodyBytes, "quota.state").String()))
-		if state != "" && state != "known" {
-			reason := strings.TrimSpace(gjson.GetBytes(bodyBytes, "quota.reason").String())
-			if reason == "" {
-				reason = "Step Plan quota unavailable (" + state + ")"
-			}
+		if reason := stepFunQuotaUnavailable(bodyBytes); reason != "" {
 			result.Error = reason
 			result.CredentialValid = true
 			return result, nil
@@ -286,7 +282,7 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 	case PlatformStepfun:
 		tiers, result.PlanLevel = parseStepFunUsageTiers(bodyBytes)
 		if len(tiers) == 0 {
-			result.Error = "Step Plan quota response has no usage windows"
+			result.Error = "Step Plan quota response has no usable usage windows"
 			result.CredentialValid = true
 			return result, nil
 		}

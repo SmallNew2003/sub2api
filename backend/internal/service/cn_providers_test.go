@@ -394,6 +394,115 @@ func TestParseStepFunUsageTiers_CreditWinsOverMonthlyWindow(t *testing.T) {
 	require.InDelta(t, 75, tiers[0].UsedPercent, 1e-9)
 }
 
+// TestStepFunQuotaUnavailable 固化 cc-switch usage_script 的不可用判定：
+// state 必须恰为 known、buckets/windows 不能同时为空、allowed 不能为 false。
+func TestStepFunQuotaUnavailable(t *testing.T) {
+	t.Parallel()
+	require.Empty(t, stepFunQuotaUnavailable([]byte(`{
+		"quota": {"state": "known", "allowed": true, "credit_buckets": [{"total": 1, "remaining": 1}]}
+	}`)))
+	// state 缺失同样视为不可用（cc-switch 用 !== 严格比较）。
+	require.Equal(t, "Step Plan is not activated on this account",
+		stepFunQuotaUnavailable([]byte(`{"quota": {"credit_buckets": [{"total": 1, "remaining": 1}]}}`)))
+	require.Equal(t, "Step Plan is not activated on this account",
+		stepFunQuotaUnavailable([]byte(`{"quota": {"state": "unknown"}}`)))
+	require.Equal(t, "Step Plan is not activated on this account",
+		stepFunQuotaUnavailable([]byte(`{"quota": {"state": "KNOWN"}}`)), "state 大小写不宽容")
+	require.Equal(t, "Step Plan quota has no usage data",
+		stepFunQuotaUnavailable([]byte(`{"plan": {"state": "known"}, "quota": {"state": "known"}}`)))
+	require.Equal(t, "quota exhausted",
+		stepFunQuotaUnavailable([]byte(`{"quota": {"state": "known", "reason": "quota exhausted"}}`)),
+		"上游 reason 优先")
+	require.Equal(t, "Step Plan is not activated on this account",
+		stepFunQuotaUnavailable([]byte(`{
+			"quota": {"state": "known", "allowed": false, "credit_buckets": [{"total": 1, "remaining": 1}]}
+		}`)))
+}
+
+// TestParseStepFunUsageTiers_PrefersUsedPercent 上游自带 used_percent 时以它
+// 为准（按 total 加权），不再用 total/remaining 反推。
+func TestParseStepFunUsageTiers_PrefersUsedPercent(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"quota": {
+			"state": "known",
+			"credit_buckets": [
+				{"total": 1000000, "remaining": 200000, "used_percent": 80, "expires_at_ms": 1700000000000},
+				{"total": 3000000, "remaining": 1800000, "used_percent": 40, "expires_at_ms": 1700000000000}
+			]
+		}
+	}`)
+	tiers, _ := parseStepFunUsageTiers(body)
+	require.Len(t, tiers, 1)
+	require.InDelta(t, 50, tiers[0].UsedPercent, 1e-9) // (80*1M + 40*3M) / 4M
+}
+
+// TestParseStepFunUsageTiers_KeepsUnknownWindow 无法归一到 5h/weekly/monthly
+// 的窗口保留净化后的原始标签，不像 cc-switch 那样有数据却也不该被静默丢弃。
+func TestParseStepFunUsageTiers_KeepsUnknownWindow(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"quota": {
+			"state": "known",
+			"credit_buckets": [],
+			"windows": [
+				{"name": "Daily Burst", "used_percent": 12.5, "resets_at_ms": 1700000000000},
+				{"type": "trial-period", "used_percent": 30, "resets_at_ms": 1700000000000},
+				{"used_percent": 7, "resets_at_ms": 1700000000000}
+			]
+		}
+	}`)
+	tiers, _ := parseStepFunUsageTiers(body)
+	require.Len(t, tiers, 3)
+	require.Equal(t, "daily_burst", tiers[0].Window)
+	require.Equal(t, "trial_period", tiers[1].Window)
+	require.Equal(t, "window_3", tiers[2].Window)
+}
+
+// TestStepFunUsage_RealStepPlanPayload 用一次真实 GET /step_plan/v1/usage
+// 的响应（2026-10-20 抓取，账号 ID 已剔除）固化端到端解析：
+// total / remaining 是字符串而非数字，used_percent 由上游直接给出。
+func TestStepFunUsage_RealStepPlanPayload(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"schema_version": 1,
+		"observed_at_ms": 1792478226039,
+		"scope": "personal_account",
+		"plan": {
+			"state": "known",
+			"family": "token",
+			"name": "Token-Pro-月付-官方原价",
+			"subscription": {"id": "66101", "expires_at_ms": 1794362513000}
+		},
+		"quota": {
+			"state": "known",
+			"allowed": true,
+			"reason": null,
+			"windows": [],
+			"credit_buckets": [
+				{
+					"type": "subscription",
+					"total": "8000000000",
+					"remaining": "5899919867",
+					"used_percent": 26.251001662500002,
+					"resets_at_ms": null,
+					"expires_at_ms": 1794362513000
+				}
+			]
+		}
+	}`)
+
+	require.Empty(t, stepFunQuotaUnavailable(body))
+
+	tiers, plan := parseStepFunUsageTiers(body)
+	require.Equal(t, "Token-Pro-月付-官方原价", plan)
+	require.Len(t, tiers, 1)
+	require.Equal(t, "monthly", tiers[0].Window)
+	// 上游 used_percent 优先；与 (8e9 - 5899919867) / 8e9 一致。
+	require.InDelta(t, 26.251001662500002, tiers[0].UsedPercent, 1e-9)
+	require.Equal(t, time.UnixMilli(1794362513000).UTC().Format(time.RFC3339), tiers[0].ResetAt)
+}
+
 func TestParseMiniMaxUsageTiers(t *testing.T) {
 	t.Parallel()
 	endMs := int64(1_700_000_000_000)
