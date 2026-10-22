@@ -147,6 +147,7 @@
       "display_name": "StepFun",
       "gateway": "openai",
       "cn_provider": true,
+      "litellm_provider": "stepfun",
       "multi_protocol": {
         "default_mode": "payg",
         "routing": "by_inbound",

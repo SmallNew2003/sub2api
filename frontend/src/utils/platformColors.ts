@@ -297,6 +297,7 @@ function isPlatform(p: string): p is Platform {
     p === 'zhipu' ||
     p === 'deepseek' ||
     p === 'minimax' ||
+    p === 'stepfun' ||
     p === 'opencode_go' ||
     p === 'typesafe' ||
     p === 'command_code' ||

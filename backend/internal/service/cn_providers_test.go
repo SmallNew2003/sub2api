@@ -437,6 +437,22 @@ func TestParseStepFunUsageTiers_PrefersUsedPercent(t *testing.T) {
 	require.InDelta(t, 50, tiers[0].UsedPercent, 1e-9) // (80*1M + 40*3M) / 4M
 }
 
+func TestParseStepFunUsageTiers_MixedUsedPercentFallsBackToRemainingRatio(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"quota": {
+			"state": "known",
+			"credit_buckets": [
+				{"total": 100, "remaining": 0},
+				{"total": 100, "remaining": 100, "used_percent": 0}
+			]
+		}
+	}`)
+	tiers, _ := parseStepFunUsageTiers(body)
+	require.Len(t, tiers, 1)
+	require.InDelta(t, 50, tiers[0].UsedPercent, 1e-9)
+}
+
 // TestParseStepFunUsageTiers_KeepsUnknownWindow 无法归一到 5h/weekly/monthly
 // 的窗口保留净化后的原始标签，不像 cc-switch 那样有数据却也不该被静默丢弃。
 func TestParseStepFunUsageTiers_KeepsUnknownWindow(t *testing.T) {

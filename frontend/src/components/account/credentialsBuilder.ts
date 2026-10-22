@@ -597,13 +597,31 @@ function officialAccountAPISupported(account: CNUsageCellAccount, mode: string):
   }
 }
 
+/** Step Plan 只允许官方 .com / .ai 的 /step_plan[/v1] 端点查询用量。 */
+function officialStepPlanAPISupported(account: CNUsageCellAccount, mode: string): boolean {
+  if (account.type !== 'apikey') return false
+  try {
+    const target = new URL(accountChatBaseUrl(account, mode))
+    const path = target.pathname.replace(/\/+$/, '')
+    return target.protocol === 'https:' &&
+      (target.hostname === 'api.stepfun.com' || target.hostname === 'api.stepfun.ai') &&
+      (target.port === '' || target.port === '443') &&
+      target.username === '' && target.password === '' &&
+      target.search === '' && target.hash === '' &&
+      (path === '/step_plan' || path === '/step_plan/v1')
+  } catch {
+    return false
+  }
+}
+
 export function cnQuotaCellVisible(account: CNUsageCellAccount): boolean {
   const { platform } = account
   const mode = cnUsageCellAccountMode(account)
   if (platform === 'opencode_go') return mode !== 'zen'
+  if (platform === 'stepfun') return mode === 'coding' && officialStepPlanAPISupported(account, mode)
   // Command Code、Cline：订阅窗口与积分由一次探测同时刷新。
   if (OFFICIAL_ACCOUNT_API_PLATFORMS.includes(platform)) return officialAccountAPISupported(account, mode)
-  return (platform === 'kimi' || platform === 'zhipu' || platform === 'minimax' || platform === 'stepfun') && mode === 'coding'
+  return (platform === 'kimi' || platform === 'zhipu' || platform === 'minimax') && mode === 'coding'
 }
 
 export function cnBalanceCellVisible(account: CNUsageCellAccount): boolean {

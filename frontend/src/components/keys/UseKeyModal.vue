@@ -1318,6 +1318,7 @@ function generateRoutedCodexFiles(
     zhipu: 'glm-4.7',
     deepseek: 'deepseek-v4-pro',
     minimax: 'MiniMax-M3',
+    stepfun: 'step-3.5-flash',
     opencode_go: 'glm-5.3',
     composite: 'gpt-5.5'
   }

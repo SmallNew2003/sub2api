@@ -4,12 +4,122 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/tidwall/gjson"
 )
 
-// DefaultStepFunTestModel 是连接测试的默认模型；Step Plan 与 payg 均可用。
-const DefaultStepFunTestModel = "step-3.5-flash"
+const (
+	// DefaultStepFunTestModel 是连接测试的默认模型；Step Plan 与 payg 均可用。
+	DefaultStepFunTestModel = "step-3.5-flash"
+
+	// StepFunUsageAutoRefreshExtraKey 控制 Step Plan 账号是否参与周期用量探测。
+	// 字段缺失按开启处理，保持接入账号级开关前的既有行为。
+	StepFunUsageAutoRefreshExtraKey = "stepfun_usage_auto_refresh"
+	// StepFunUsageSnapshotExtraKey 保存最近一次 Step Plan 用量探测的完整展示状态。
+	StepFunUsageSnapshotExtraKey = "stepfun_usage_snapshot"
+	// StepFunUsageAttemptSeqExtraKey 保存数据库分配的最后一次探测序号。
+	// 探测开始时先取序号，完成写入时只允许更大序号覆盖，避免跨实例时钟漂移。
+	StepFunUsageAttemptSeqExtraKey = "stepfun_usage_attempt_seq"
+
+	StepFunUsageStatusOK          = "ok"
+	StepFunUsageStatusFailed      = "failed"
+	StepFunUsageStatusUnavailable = "unavailable"
+)
+
+// stepPlanManagedExtraKeys 是 Step Plan 探测/刷新服务独占的运行态字段。
+// 普通账号编辑、创建、批量更新和 key 级 Extra 合并都必须剥离客户端值。
+var stepPlanManagedExtraKeys = []string{
+	StepFunUsageAutoRefreshExtraKey,
+	StepFunUsageSnapshotExtraKey,
+	StepFunUsageAttemptSeqExtraKey,
+	cnExtraKey(PlatformStepfun, cnExtraSuffix5hUsed),
+	cnExtraKey(PlatformStepfun, cnExtraSuffix5hReset),
+	cnExtraKey(PlatformStepfun, cnExtraSuffixWeeklyUsed),
+	cnExtraKey(PlatformStepfun, cnExtraSuffixWeeklyReset),
+	cnExtraKey(PlatformStepfun, cnExtraSuffixMonthlyUsed),
+	cnExtraKey(PlatformStepfun, cnExtraSuffixMonthlyReset),
+	cnExtraKey(PlatformStepfun, cnExtraSuffixUsageUpdated),
+}
+
+func deleteStepPlanManagedExtraKeys(extra map[string]any) {
+	if extra == nil {
+		return
+	}
+	for _, key := range stepPlanManagedExtraKeys {
+		delete(extra, key)
+	}
+}
+
+func stepFunUsageIdentity(account *Account) map[string]any {
+	if account == nil || account.GetCodingPlanProvider() != PlatformStepfun {
+		return nil
+	}
+	return map[string]any{
+		"api_key":  account.GetCNAPIKey(),
+		"base_url": account.GetOpenAIBaseURL(),
+	}
+}
+
+// StepFunUsageSnapshot 是 Step Plan 最近一次探测的结构化快照。平铺的
+// stepfun_5h/weekly/monthly_* 键继续供调度阈值使用，本结构供账号编辑面板
+// 展示状态、套餐、失败原因和最近尝试时间。
+type StepFunUsageSnapshot struct {
+	Status          string        `json:"status"`
+	CredentialValid bool          `json:"credential_valid"`
+	PlanLevel       string        `json:"plan_level,omitempty"`
+	Tiers           []CNQuotaTier `json:"tiers,omitempty"`
+	FetchedAt       *time.Time    `json:"fetched_at,omitempty"`
+	LastAttemptAt   time.Time     `json:"last_attempt_at"`
+	HTTPStatus      int           `json:"http_status,omitempty"`
+	LastError       string        `json:"last_error,omitempty"`
+}
+
+// StepPlanUsageState 是账号编辑页使用的 Step Plan 用量状态。
+type StepPlanUsageState struct {
+	AccountID          int64                 `json:"account_id"`
+	Eligible           bool                  `json:"eligible"`
+	AutoRefreshEnabled bool                  `json:"auto_refresh_enabled"`
+	Snapshot           *StepFunUsageSnapshot `json:"snapshot,omitempty"`
+}
+
+func newStepFunUsageSnapshot(result *CNProviderQuotaProbeResult, now time.Time) StepFunUsageSnapshot {
+	snapshot := StepFunUsageSnapshot{
+		Status:          StepFunUsageStatusFailed,
+		LastAttemptAt:   now.UTC(),
+		CredentialValid: result != nil && result.CredentialValid,
+	}
+	if result == nil {
+		return snapshot
+	}
+	if result.Success {
+		snapshot.Status = StepFunUsageStatusOK
+		fetchedAt := now.UTC()
+		snapshot.FetchedAt = &fetchedAt
+	} else if result.CredentialValid && result.StatusCode >= 200 && result.StatusCode < 300 {
+		// 2xx 只说明鉴权通过；业务响应明确表示套餐/额度不可用时才标 unavailable。
+		snapshot.Status = StepFunUsageStatusUnavailable
+	}
+	snapshot.PlanLevel = result.PlanLevel
+	snapshot.HTTPStatus = result.StatusCode
+	snapshot.LastError = result.Error
+	if len(result.Tiers) > 0 {
+		snapshot.Tiers = append([]CNQuotaTier(nil), result.Tiers...)
+	}
+	return snapshot
+}
+
+// stepFunUsageAutoRefreshEnabled 返回 Step Plan 账号级自动刷新开关；缺失时默认开启。
+func stepFunUsageAutoRefreshEnabled(account *Account) bool {
+	if account == nil || account.Extra == nil {
+		return true
+	}
+	enabled, ok := account.Extra[StepFunUsageAutoRefreshExtraKey].(bool)
+	if !ok {
+		return true
+	}
+	return enabled
+}
 
 // stepFunQuotaUnavailable 判定 Step Plan 订阅额度是否不可用，语义照搬
 // cc-switch 的 usage_script extractor：
@@ -75,6 +185,30 @@ func stepfunQuotaURL(baseURL string) string {
 	return base + "/v1/usage"
 }
 
+// stepFunQuotaExtraUpdates 在通用窗口快照之上显式清空本次成功响应未包含的
+// Step Plan 窗口。否则旧 5h/weekly/monthly 键会跨套餐/窗口变更继续参与调度阈值。
+func stepFunQuotaExtraUpdates(tiers []CNQuotaTier, now time.Time) map[string]any {
+	updates := cnQuotaExtraUpdates(PlatformStepfun, tiers, now)
+	present := make(map[string]CNQuotaTier, len(tiers))
+	for _, tier := range tiers {
+		present[tier.Window] = tier
+	}
+	for _, window := range []string{"5h", "weekly", "monthly"} {
+		usedKey := cnExtraKey(PlatformStepfun, window+"_used_percent")
+		resetKey := cnExtraKey(PlatformStepfun, window+"_reset_at")
+		tier, ok := present[window]
+		if !ok {
+			updates[usedKey] = nil
+			updates[resetKey] = nil
+			continue
+		}
+		if tier.ResetAt == "" {
+			updates[resetKey] = nil
+		}
+	}
+	return updates
+}
+
 // parseStepFunUsageTiers 解析 GET /step_plan/v1/usage。
 //
 //	quota.credit_buckets[]  → Credit 月池（total/remaining/used_percent/expires_at_ms）
@@ -96,6 +230,7 @@ func parseStepFunUsageTiers(body []byte) ([]CNQuotaTier, string) {
 		var total, remaining, percentWeight, percentSum float64
 		var resetAt string
 		count := 0
+		allHaveUsedPercent := true
 		buckets.ForEach(func(_, bucket gjson.Result) bool {
 			bucketTotal, okTotal := cnParseF64(bucket.Get("total").Value())
 			bucketRemaining, okRemaining := cnParseF64(bucket.Get("remaining").Value())
@@ -107,6 +242,8 @@ func parseStepFunUsageTiers(body []byte) ([]CNQuotaTier, string) {
 			if usedPercent, ok := cnParseF64(bucket.Get("used_percent").Value()); ok {
 				percentWeight += bucketTotal
 				percentSum += usedPercent * bucketTotal
+			} else {
+				allHaveUsedPercent = false
 			}
 			if resetAt == "" {
 				resetAt = cnNormalizeResetTime(bucket.Get("expires_at_ms").Value())
@@ -116,7 +253,9 @@ func parseStepFunUsageTiers(body []byte) ([]CNQuotaTier, string) {
 		})
 		if count > 0 && total > 0 {
 			usedPercent := (total - remaining) / total * 100
-			if percentWeight > 0 {
+			// 只有所有有效 bucket 都带 used_percent 时才能信任加权百分比；
+			// 混合缺失时按 total/remaining 统一反推，避免忽略部分 bucket。
+			if allHaveUsedPercent && percentWeight > 0 {
 				usedPercent = percentSum / percentWeight
 			}
 			if usedPercent < 0 {
@@ -185,9 +324,9 @@ func sanitizeStepFunWindowLabel(raw string) string {
 	for _, r := range strings.ToLower(strings.TrimSpace(raw)) {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			b.WriteRune(r)
+			_, _ = b.WriteRune(r)
 		case r == ' ', r == '-', r == '_', r == '.':
-			b.WriteByte('_')
+			_ = b.WriteByte('_')
 		}
 	}
 	return strings.Trim(b.String(), "_")

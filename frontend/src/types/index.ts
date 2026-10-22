@@ -1226,6 +1226,30 @@ export interface OpenCodeGoUsageSettings {
   debounce_minutes: number
 }
 
+export type StepPlanUsageStatus = 'ok' | 'failed' | 'unavailable'
+
+export interface StepPlanUsageSnapshot {
+  status: StepPlanUsageStatus
+  credential_valid: boolean
+  plan_level?: string
+  tiers?: {
+    window: string
+    used_percent: number
+    reset_at?: string
+  }[]
+  fetched_at?: string
+  last_attempt_at: string
+  http_status?: number
+  last_error?: string
+}
+
+export interface StepPlanUsageState {
+  account_id: number
+  eligible: boolean
+  auto_refresh_enabled: boolean
+  snapshot?: StepPlanUsageSnapshot
+}
+
 export interface Account {
   id: number
   name: string
@@ -1267,6 +1291,8 @@ export interface Account {
       last_result_at?: string
       error_code?: string
     }
+    stepfun_usage_auto_refresh?: boolean
+    stepfun_usage_snapshot?: StepPlanUsageSnapshot
   } & Record<string, unknown>)
   proxy_id: number | null
   proxy_fallback_origin_id?: number | null
